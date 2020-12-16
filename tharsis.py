@@ -194,7 +194,7 @@ def announcementWorkerMethod(workerID, comms):
             pe.send(reqID) # Hope this doesn't block (buffer full)
             # A subscription model where only some workers get some messages might be better.
 
-def revivalWorkerMethod(workerID, pipeEnd, comms):
+def revivalWorkerMethod(workerID, comms, pipeEnd):
     '''Restart calculations which were on hold waiting for inputs'''
     # Questionable method
     tasks = []
@@ -230,9 +230,9 @@ def revivalWorkerMethod(workerID, pipeEnd, comms):
                 # We got a new one
                 tasks.append(WaitingRequest((set(c.reqID for c in code if isinstance(c, NonExistingResult)), reqID, code)))
 
-def logWorkerMethod( workerID, inQ ):
+def logWorkerMethod( workerID, comms ):
     while True:
-        msg =  inQ.get()
+        msg =  comms.toBeLoggedQ.get()
         print(msg)
 
 
@@ -255,15 +255,17 @@ if __name__ == '__main__':
         toBeReportedQ = mp.Queue()
         toBeRevivedQ = mp.Queue()
         toBeLoggedQ = mp.Queue()
-        resultRecvrs, resultSendrs = [multiprocessing.Pipe() for _ in range(nRevivalWorkers)]
+        resultRecvrs, resultSendrs = zip(*(mp.Pipe() for _ in range(nRevivalWorkers)))
 
-        comms = comms(resultsDB,
+        comms = Comms(resultsDB,
                       toBeCalculatedQ,
                       toBeAnnouncedQ,
                       toBeReportedQ,
                       toBeRevivedQ,
                       toBeLoggedQ,
                       resultSendrs)
+
+        print(comms)
 
         calculationWorkers = [mp.Process(target=calculationWorkerMethod, args=((i, 'C'), comms)) for i in range(nCalculationWorkers)]
         for w in calculationWorkers: w.start()
@@ -274,21 +276,15 @@ if __name__ == '__main__':
         reportWorkers = [mp.Process(target=reportWorkerMethod, args=((i, 'R'), comms)) for i in range(nReportWorkers)]
         for w in reportWorkers: w.start()
 
-        revivalWorkers = [mp.Process(target=revivalWorkerMethod, args=((i, 'V'), comms)) for i in range(nRevivalWorkers))]
+        revivalWorkers = [mp.Process(target=revivalWorkerMethod, args=((i, 'V'), comms, pipeEnd)) for i, pipeEnd in enumerate(resultRecvrs)]
         for w in revivalWorkers: w.start()
 
-        logWorkers = [ mp.Process(target=logWorkerMethod, args = ( (i 'L'), comms)) for i in range(nLogWorkers)]
+        logWorkers = [mp.Process(target=logWorkerMethod, args=((i, 'L'), comms)) for i in range(nRevivalWorkers)]
         for w in logWorkers: w.start()
 
-        for code in [ ( 'sum', 1, ( 'prod', 2, 3 ) ),98
+        for code in [ ( 'sum', 1, ( 'prod', 2, 3 ) ),
                       ( 'frac', 1, 2, 3, 4 ),
                       ( 'frac', ( 'sum', 1., 2. ), ( 'prod', 3., 4. ) ),
                       ( 'frac', ( ( 'evalsToSum', ), 1., 2. ), ( 'prod', 3., 4. ) ),
                     ]:
-            #reqID = reqIdFromCode( code )
-            #toBeCalculatedQ.put( ( reqID, code ) )
             reqID = addToCalcQueue(code, toBeCalculatedQ)
-
-        for w in calculationWorkers + reportWorkers + logWorkers:
-            #w.terminate()
-            w.join()
