@@ -146,7 +146,7 @@ def calculationWorkerMethod( workerID, comms):
                 comms.resultsDB[reqID] = res
                 comms.toBeReportedQ.put( reqID )
                 comms.toBeAnnouncedQ.put( reqID )
-                comms.toBeLoggedQ.put('[{:s}] {:s} completed {:x} -> {:s}'.format(timeStampStr(), str(workerID), reqID, str(res)))
+                #comms.toBeLoggedQ.put('[{:s}] {:s} completed {:x} -> {:s}'.format(timeStampStr(), str(workerID), reqID, str(res)))
             elif any( isinstance(c, tuple) for c in code ):
                 # We have sub-code to evaluate
                 newCode = []
@@ -165,14 +165,14 @@ def calculationWorkerMethod( workerID, comms):
                         newCode.append(c)
                 # Preserve already existing ID. Which is now no longer aligned with hash.
                 comms.toBeRevivedQ.put((reqID, tuple(newCode)))
-                comms.toBeLoggedQ.put('[{:s}] {:s} sending {:x} to toBeRevivedQ.'.format(timeStampStr(), str(workerID), reqID))
+                #comms.toBeLoggedQ.put('[{:s}] {:s} sending {:x} to toBeRevivedQ.'.format(timeStampStr(), str(workerID), reqID))
             else:
                 # No sub-code, just evaluate.
                 res = Language.eval([ resultsDB[c.reqID] if isinstance(c, NonExistingResult) else c for c in code ])
                 comms.resultsDB[ reqID ] = res
                 comms.toBeReportedQ.put( reqID )
                 comms.toBeAnnouncedQ.put( reqID )
-                comms.toBeLoggedQ.put('[{:s}] {:s} completed {:x} -> {:s}'.format(timeStampStr(), str(workerID), reqID, str(res)))
+                #comms.toBeLoggedQ.put('[{:s}] {:s} completed {:x} -> {:s}'.format(timeStampStr(), str(workerID), reqID, str(res)))
 
 
 def reportWorkerMethod( workerID, comms ):
@@ -190,7 +190,7 @@ def announcementWorkerMethod(workerID, comms):
         reqID = comms.toBeAnnouncedQ.get()
         for pe in comms.resultSendrs:
             pe.send(reqID) # Hope this doesn't block (buffer full)
-            comms.toBeLoggedQ.put("[{:s}] {:s} Announcing {:x}".format(timeStampStr(), str(workerID), reqID))
+            #comms.toBeLoggedQ.put("[{:s}] {:s} Announcing {:x}".format(timeStampStr(), str(workerID), reqID))
             # A subscription model where only some workers get some messages might be better.
 
 def revivalWorkerMethod(workerID, comms, pipeEnd):
@@ -218,7 +218,7 @@ def revivalWorkerMethod(workerID, comms, pipeEnd):
         if pipeEnd.poll():
             # Listen for announcements that other workers have completed calcualtions and see if any of our tasks depend on them.
             finishedReqID = pipeEnd.recv()
-            comms.toBeLoggedQ.put("[{:s}] {:s} Noticed {:x}".format(timeStampStr(), str(workerID), finishedReqID))
+            #comms.toBeLoggedQ.put("[{:s}] {:s} Noticed {:x}".format(timeStampStr(), str(workerID), finishedReqID))
             tasks = [updateTask(t, finishedReqID) for t in tasks if t is not None]
 
         if not comms.toBeRevivedQ.empty():
@@ -235,7 +235,7 @@ def revivalWorkerMethod(workerID, comms, pipeEnd):
                 deps = set((c.reqID for c in code if isinstance(c, NonExistingResult)))
                 newTask = WaitingRequest(deps, reqID, code)
                 tasks.append(newTask)
-                comms.toBeLoggedQ.put("[{:s}] {:s} Took on {:x} with deps {:s}".format(timeStampStr(), str(workerID), reqID, str(deps)))
+                #comms.toBeLoggedQ.put("[{:s}] {:s} Took on {:x} with deps {:s}".format(timeStampStr(), str(workerID), reqID, str(deps)))
 
 def logWorkerMethod( workerID, comms ):
     while True:
@@ -251,10 +251,10 @@ def logWorkerMethod( workerID, comms ):
 # Example
 
 if __name__ == '__main__':
-    nCalculationWorkers = 1
-    nReportWorkers = 1 # One while we are just using print
-    nRevivalWorkers = 1
-    nLogWorkers = 1
+    nCalculationWorkers = 4
+    nReportWorkers = 2
+    nRevivalWorkers = 2
+    nLogWorkers = 1 # Keep at 1 or print statements will get mixed together
     with mp.Manager() as resultsDBMgr:
         resultsDB = resultsDBMgr.dict()
         toBeCalculatedQ = mp.Queue()
@@ -289,13 +289,13 @@ if __name__ == '__main__':
         logWorkers = [mp.Process(target=logWorkerMethod, args=((i, 'L'), comms)) for i in range(nRevivalWorkers)]
         for w in logWorkers: w.start()
 
-        for code in [ #( 'sum', 1, ( 'prod', 2, 3 ) ),
-                      #( 'frac', 1, 2, 3, 4 ),
+        for code in [ ( 'sum', 1, ( 'prod', 2, 3 ) ),
+                      ( 'frac', 1, 2, 3, 4 ),
                       ( 'frac', ( 'sum', 1., 2. ), ( 'prod', 3., 4. ) ),
-                      #( 'frac', ( ( 'evalsToSum', ), 1., 2. ), ( 'prod', 3., 4. ) ),
+                      ( 'frac', ( ( 'evalsToSum', ), 1., 2. ), ( 'prod', 3., 4. ) ),
                     ]:
             reqID = reqIdFromCode(code)
-            print("User requesting {:x}".format(reqID))
+            toBeLoggedQ.put("User requesting {:x}".format(reqID))
             toBeCalculatedQ.put((reqID, code))
 
 
