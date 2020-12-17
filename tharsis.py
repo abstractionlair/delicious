@@ -67,27 +67,14 @@ def reqIdFromCode(code):
     '''Standardizes code -> request ID generation'''
     return hash(code)
 
-def addToCalcQueue(code, toBeCalculatedQ ):
-    '''Standardizes format of calculation queue items'''
-    reqID = reqIdFromCode(code)
-    toBeCalculatedQ.put((reqID, code))
-    return reqID
-
-def reAddToCalcQueue(code, toBeCalculatedQ, reqID):
-    '''When you already have an ID'''
-    toBeCalculatedQ.put((reqID, code))
-
 NonExistingResult = namedtuple('NonExistingResult', ['reqID'] )
 
-ExistingResult = namedtuple('ExistingResult', ['reqID'] )
-
-class WaitingRequest(object):
-    # Want mutability for this one
-    # Will be owned by a single worker method
+#WaitingRequest = namedtuple('WaitingRequest', ['deps', 'reqID', 'code'])
+class WaitingRequest( object ):
     def __init__(self, deps, reqID, code):
         self.deps = deps
         self.reqID = reqID
-        self.code = list(code)
+        self.code = code
 
 Comms = namedtuple( 'Comms', [  'resultsDB',        # Db where results are stored
                                 'toBeCalculatedQ',  # Queue for calculations ready to run
@@ -95,7 +82,6 @@ Comms = namedtuple( 'Comms', [  'resultsDB',        # Db where results are store
                                 'toBeReportedQ',    # Queue for calculations finished which need to be reported to user
                                 'toBeRevivedQ',     # Queue for calculations waiting for inputs to be ready
                                 'toBeLoggedQ',      # Queue for messages to be logged
-                                #'resultRecvrs',     # Pipe ends from which completed request IDs are read
                                 'resultSendrs',     # Pipe ends where completed request IDs are sent
                              ] )
 
@@ -154,35 +140,47 @@ def calculationWorkerMethod( workerID, comms):
     while True:
         reqID, code = comms.toBeCalculatedQ.get()
         if reqID not in comms.resultsDB:
+            # If it was in the db there'd be nothing for us to do
             if not code:
-                comms.resultsDB[reqID] = Language.eval(code)
+                res = Language.eval(code)
+                comms.resultsDB[reqID] = res
+                comms.toBeReportedQ.put( reqID )
+                comms.toBeAnnouncedQ.put( reqID )
+                comms.toBeLoggedQ.put('[{:s}] {:s} completed {:x} -> {:s}'.format(timeStampStr(), str(workerID), reqID, str(res)))
             elif any( isinstance(c, tuple) for c in code ):
                 # We have sub-code to evaluate
-                children = []
                 newCode = []
                 for c in code:
                     if isinstance(c, tuple):
                         # Nested function call
                         # FIXME: check if results is already in db
-                        childReqID = addToCalcQueue(c, comms.toBeCalculatedQ)
-                        children.append(childReqID)
-                        newCode.append(NonExistingResult(childReqID))
+                        childReqID = reqIdFromCode(c)
+                        if childReqID not in comms.resultsDB:
+                            comms.toBeCalculatedQ.put((childReqID, c))
+                            newCode.append(NonExistingResult(childReqID))
+                        else:
+                            newCode.append(comms.resultsDB[childReqID])
                     else:
                         # Plain old data
                         newCode.append(c)
-                addToCalcQueue(newCode, comms.toBeRevivedQ)
+                # Preserve already existing ID. Which is now no longer aligned with hash.
+                comms.toBeRevivedQ.put((reqID, tuple(newCode)))
+                comms.toBeLoggedQ.put('[{:s}] {:s} sending {:x} to toBeRevivedQ.'.format(timeStampStr(), str(workerID), reqID))
             else:
-                comms.resultsDB[ reqID ] = Language.eval([ resultsDB[c.reqID] if isinstance(c, NonExistingResult) else c for c in code ])
-
-        comms.toBeReportedQ.put( reqID )
-        comms.toBeLoggedQ.put('[{:s}] {:s} completed {:x}'.format(timeStampStr(), str(workerID), reqID))
+                # No sub-code, just evaluate.
+                res = Language.eval([ resultsDB[c.reqID] if isinstance(c, NonExistingResult) else c for c in code ])
+                comms.resultsDB[ reqID ] = res
+                comms.toBeReportedQ.put( reqID )
+                comms.toBeAnnouncedQ.put( reqID )
+                comms.toBeLoggedQ.put('[{:s}] {:s} completed {:x} -> {:s}'.format(timeStampStr(), str(workerID), reqID, str(res)))
 
 
 def reportWorkerMethod( workerID, comms ):
     '''Report result to end user'''
     while True:
         reqID = comms.toBeReportedQ.get()
-        print( "DONE: {:x}".format(reqID) ) # Imagine this getting back to the user somehow
+        # Imagine this getting back to the user somehow
+        comms.toBeLoggedQ.put("[{:s}] {:s} DONE {:x}".format(timeStampStr(), str(workerID), reqID))
 
 def announcementWorkerMethod(workerID, comms):
     '''Announce results to other workers'''
@@ -192,6 +190,7 @@ def announcementWorkerMethod(workerID, comms):
         reqID = comms.toBeAnnouncedQ.get()
         for pe in comms.resultSendrs:
             pe.send(reqID) # Hope this doesn't block (buffer full)
+            comms.toBeLoggedQ.put("[{:s}] {:s} Announcing {:x}".format(timeStampStr(), str(workerID), reqID))
             # A subscription model where only some workers get some messages might be better.
 
 def revivalWorkerMethod(workerID, comms, pipeEnd):
@@ -204,7 +203,7 @@ def revivalWorkerMethod(workerID, comms, pipeEnd):
         if finishedReqID not in task.deps:
             return task
         else:
-            task.code = [ExistingResult(c) if isinstance(c, NonExistingResult) else c for c in task.code]
+            task.code = [comms.resultsDB[c.reqID] if isinstance(c, NonExistingResult) and c.reqID == finishedReqID else c for c in task.code]
             task.deps.remove(finishedReqID)
             if task.deps:
                 # There are still unmet deps
@@ -212,23 +211,31 @@ def revivalWorkerMethod(workerID, comms, pipeEnd):
             else:
                 # This guy is ready
                 # Do something
-                reAddToCalcQueue(task.code, comms.toBeCalculatedQ, task.reqID)
+                comms.toBeCalculatedQ.put((task.reqID, task.code))
                 return None
 
     while True:
         if pipeEnd.poll():
+            # Listen for announcements that other workers have completed calcualtions and see if any of our tasks depend on them.
             finishedReqID = pipeEnd.recv()
+            comms.toBeLoggedQ.put("[{:s}] {:s} Noticed {:x}".format(timeStampStr(), str(workerID), finishedReqID))
             tasks = [updateTask(t, finishedReqID) for t in tasks if t is not None]
 
         if not comms.toBeRevivedQ.empty():
             # Docs say empty() is unreliable so we still could get an exception
             try:
+                # Pick up new tasks
                 reqID, code = comms.toBeRevivedQ.get_nowait()
             except queue.Empty:
                 pass # Nothing in queue, keep polling
             else:
                 # We got a new one
-                tasks.append(WaitingRequest((set(c.reqID for c in code if isinstance(c, NonExistingResult)), reqID, code)))
+                # Some results could have come in since this was added to the queue, so check now
+                code = [comms.resultsDB[c.reqID] if isinstance(c, NonExistingResult) and c.reqID == finishedReqID else c for c in code]
+                deps = set((c.reqID for c in code if isinstance(c, NonExistingResult)))
+                newTask = WaitingRequest(deps, reqID, code)
+                tasks.append(newTask)
+                comms.toBeLoggedQ.put("[{:s}] {:s} Took on {:x} with deps {:s}".format(timeStampStr(), str(workerID), reqID, str(deps)))
 
 def logWorkerMethod( workerID, comms ):
     while True:
@@ -244,9 +251,9 @@ def logWorkerMethod( workerID, comms ):
 # Example
 
 if __name__ == '__main__':
-    nCalculationWorkers = 4
+    nCalculationWorkers = 1
     nReportWorkers = 1 # One while we are just using print
-    nRevivalWorkers = 2
+    nRevivalWorkers = 1
     nLogWorkers = 1
     with mp.Manager() as resultsDBMgr:
         resultsDB = resultsDBMgr.dict()
@@ -282,9 +289,15 @@ if __name__ == '__main__':
         logWorkers = [mp.Process(target=logWorkerMethod, args=((i, 'L'), comms)) for i in range(nRevivalWorkers)]
         for w in logWorkers: w.start()
 
-        for code in [ ( 'sum', 1, ( 'prod', 2, 3 ) ),
-                      ( 'frac', 1, 2, 3, 4 ),
+        for code in [ #( 'sum', 1, ( 'prod', 2, 3 ) ),
+                      #( 'frac', 1, 2, 3, 4 ),
                       ( 'frac', ( 'sum', 1., 2. ), ( 'prod', 3., 4. ) ),
-                      ( 'frac', ( ( 'evalsToSum', ), 1., 2. ), ( 'prod', 3., 4. ) ),
+                      #( 'frac', ( ( 'evalsToSum', ), 1., 2. ), ( 'prod', 3., 4. ) ),
                     ]:
-            reqID = addToCalcQueue(code, toBeCalculatedQ)
+            reqID = reqIdFromCode(code)
+            print("User requesting {:x}".format(reqID))
+            toBeCalculatedQ.put((reqID, code))
+
+
+        for w in calculationWorkers + [ announcementWorker ] + reportWorkers + revivalWorkers + logWorkers:
+            w.join()
