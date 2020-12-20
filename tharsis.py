@@ -57,8 +57,10 @@ import functools
 import operator
 from collections import namedtuple
 import queue
-import redis
 import pickle
+
+import redis
+
 
 DEBUG = False
 
@@ -82,7 +84,6 @@ Comms = namedtuple('Comms', ['resultsDB',        # Db where results are stored
                              'toBeReportedQ',    # Queue for calculations finished which need to be reported to user
                              'toBeRevivedQ',     # Queue for calculations waiting for inputs to be ready
                              'toBeLoggedQ',      # Queue for messages to be logged
-                             'resultSendrs',     # Pipe ends where completed request IDs are sent
                             ])
 
 def add_to_be_calculated_queue(comms, req_id, code):
@@ -210,13 +211,13 @@ def calculation_worker_method(worker_id, comms):
                     comms.toBeLoggedQ.put('[{:s}] {:s} sending {:s} to toBeRevivedQ.'.format(time_stanp_str(), str(worker_id), str(pickle.loads(req_id))))
 
 
-def revival_worker_method(worker_id, comms, pipe):
+def revival_worker_method(worker_id, comms):
     '''Restart calculations which were on hold waiting for inputs'''
     # Questionable method
     tasks = []
 
     comms.resultsPubSub.subscribe('calc-completed')
-    
+
     def update_task(task, finished_req_id):
         '''Update one sub-task based on knowledge of new finished_req_id'''
         if finished_req_id not in task.deps:
@@ -244,7 +245,7 @@ def revival_worker_method(worker_id, comms, pipe):
             if DEBUG:
                 comms.toBeLoggedQ.put("[{:s}] {:s} Noticed {:s}".format(time_stanp_str(), str(worker_id), str(pickle.loads(finished_req_id))))
             tasks = [update_task(t, finished_req_id) for t in tasks if t is not None]
-            
+
         if not comms.toBeRevivedQ.empty():
             # Watch for new tasks for us to manage
             # Docs say empty() is unreliable so we still could get an exception
@@ -263,12 +264,14 @@ def revival_worker_method(worker_id, comms, pipe):
                 if deps:
                     tasks.append(WaitingRequest(deps, req_id, code))
                     if DEBUG:
-                        comms.toBeLoggedQ.put("[{:s}] {:s} Took on {:s} with deps {:s}".format(time_stanp_str(), str(worker_id), str(pickle.loads(req_id)), str(deps)))
+                        comms.toBeLoggedQ.put("[{:s}] {:s} Took on {:s} with deps {:s}".format(
+                            time_stanp_str(), str(worker_id), str(pickle.loads(req_id)), str(deps)))
                 else:
                     # Everything is actually already ready
                     add_to_be_calculated_queue(comms, req_id, code)
                     if DEBUG:
-                        comms.toBeLoggedQ.put("[{:s}] {:s} {:s} is ready already".format(time_stanp_str(), str(worker_id), str(pickle.loads(req_id))))
+                        comms.toBeLoggedQ.put("[{:s}] {:s} {:s} is ready already".format(
+                            time_stanp_str(), str(worker_id), str(pickle.loads(req_id))))
 
 
 def report_worker_method(worker_id, comms):
@@ -276,7 +279,8 @@ def report_worker_method(worker_id, comms):
     while True:
         req_id = comms.toBeReportedQ.get()
         # Imagine this getting back to the user somehow
-        comms.toBeLoggedQ.put("[{:s}] {:s} DONE {:s} -> {:s}".format(time_stanp_str(), str(worker_id), str(pickle.loads(req_id)), str(pickle.loads(comms.resultsDB.get(req_id)))))
+        comms.toBeLoggedQ.put("[{:s}] {:s} DONE {:s} -> {:s}".format(
+            time_stanp_str(), str(worker_id), str(pickle.loads(req_id)), str(pickle.loads(comms.resultsDB.get(req_id)))))
 
 
 def log_worker_method(worker_id, comms):
@@ -300,26 +304,25 @@ def main():
     num_report_workers = 2
     num_revival_workers = 2
     num_log_workers = 1 # Keep at 1 or print statements will get mixed together
-    result_rcvrs, result_sndrs = zip(*(mp.Pipe() for _ in range(num_revival_workers)))
-    resultsDB = redis.Redis(host='localhost', port=6379, db=0)
-    
-    comms = Comms(resultsDB,
-                  resultsDB.pubsub(ignore_subscribe_messages=True),
+    #result_rcvrs, result_sndrs = zip(*(mp.Pipe() for _ in range(num_revival_workers)))
+    results_db = redis.Redis(host='localhost', port=6379, db=0)
+
+    comms = Comms(results_db,
+                  results_db.pubsub(ignore_subscribe_messages=True),
                   mp.Queue(),
                   mp.Queue(),
                   mp.Queue(),
-                  mp.Queue(),
-                  result_sndrs)
-    
+                  mp.Queue())
+
     calculation_workers = [mp.Process(target=calculation_worker_method, args=((i, 'C'), comms)) for i in range(num_calc_workers)]
     for w in calculation_workers:
         w.start()
-        
+
     report_workers = [mp.Process(target=report_worker_method, args=((i, 'R'), comms)) for i in range(num_report_workers)]
     for w in report_workers:
         w.start()
-        
-    revival_workers = [mp.Process(target=revival_worker_method, args=((i, 'V'), comms, pipe)) for i, pipe in enumerate(result_rcvrs)]
+
+    revival_workers = [mp.Process(target=revival_worker_method, args=((i, 'V'), comms)) for i in range(num_revival_workers)]
     for w in revival_workers:
         w.start()
 
@@ -335,7 +338,7 @@ def main():
         req_id = req_id_from_code(code)
         comms.toBeLoggedQ.put("User requesting {:s}".format(str(pickle.loads(req_id))))
         add_to_be_calculated_queue(comms, req_id, code)
-        
+
     for w in calculation_workers + report_workers + revival_workers + log_workers:
         w.join()
 
