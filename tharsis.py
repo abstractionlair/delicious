@@ -57,6 +57,8 @@ import functools
 import operator
 from collections import namedtuple
 import queue
+import redis
+import pickle
 
 DEBUG = False
 
@@ -68,7 +70,7 @@ def time_stanp_str():
 
 def req_id_from_code(code):
     '''Standardizes code -> request ID generation'''
-    return hash(code)
+    return pickle.dumps(hash(code))
 
 NonExistingResult = namedtuple('NonExistingResult', ['req_id'])
 
@@ -175,35 +177,37 @@ def calculation_worker_method(worker_id, comms):
         else:
             # Nested function call
             child_req_id = req_id_from_code(code)
-            if child_req_id not in comms.resultsDB:
+            child_res = comms.resultsDB.get(pickle.loads(child_req_id))
+            if child_res:
+                # Result is in the DB
+                return child_res
+            else:
                 # TODO: segment functions into ones meant to be distributed and ones meant to run locally then branch here.
                 add_to_be_calculated_queue(comms, child_req_id, code)
                 return NonExistingResult(child_req_id)
-            else:
-                return comms.resultsDB[child_req_id]
 
     while True:
         req_id, code = comms.toBeCalculatedQ.get()
-        if req_id not in comms.resultsDB:
+        if not comms.resultsDB.exists(req_id):
             # If it was in the db there'd be nothing for us to do
             if not any(isinstance(c, tuple) for c in code):
                 # No sub-code, just evaluate.
                 # Fill in any references to the results DB
-                code = tuple(comms.resultsDB[c.req_id] if isinstance(c, NonExistingResult) else c for c in code)
+                code = tuple(pickle.loads(comms.resultsDB.get(c.req_id)) if isinstance(c, NonExistingResult) else c for c in code)
                 res = Language.eval(code)
-                comms.resultsDB[req_id] = res
+                comms.resultsDB.set(req_id, pickle.dumps(res))
                 add_to_be_reported_queue(comms, req_id)
                 add_to_be_announced_queue(comms, req_id)
                 if DEBUG:
-                    comms.toBeLoggedQ.put('[{:s}] {:s} completed {:d} -> {:s}'.format(time_stanp_str(), str(worker_id), req_id, str(res)))
+                    comms.toBeLoggedQ.put('[{:s}] {:s} completed {:s} -> {:s}'.format(time_stanp_str(), str(worker_id), str(pickle.loads(req_id)), str(res)))
             else:
                 # We have sub-code to evaluate
                 # Fill in any references to the results DB
-                code = tuple(comms.resultsDB[c.req_id] if isinstance(c, NonExistingResult) else c for c in code)
+                code = tuple(pickle.loads(comms.resultsDB.get(c.req_id)) if isinstance(c, NonExistingResult) else c for c in code)
                 code = tuple(process_nested(c) for c in code)
                 add_to_be_revived_queue(comms, req_id, tuple(code))
                 if DEBUG:
-                    comms.toBeLoggedQ.put('[{:s}] {:s} sending {:d} to toBeRevivedQ.'.format(time_stanp_str(), str(worker_id), req_id))
+                    comms.toBeLoggedQ.put('[{:s}] {:s} sending {:s} to toBeRevivedQ.'.format(time_stanp_str(), str(worker_id), str(pickle.loads(req_id))))
 
 
 def revival_worker_method(worker_id, comms, pipe):
@@ -217,7 +221,10 @@ def revival_worker_method(worker_id, comms, pipe):
             return task
         else:
             # Fill in any results we can find in the db, including ones other than finished_req_id. Why wait if they are available?
-            code = tuple(comms.resultsDB[c.req_id] if isinstance(c, NonExistingResult) else c for c in task.code)
+            code = tuple(pickle.loads(comms.resultsDB.get(c.req_id))
+                         if isinstance(c, NonExistingResult) and comms.resultsDB.exists(c.req_id)
+                         else c
+                         for c in task.code)
             deps = {c.req_id for c in code if isinstance(c, NonExistingResult)}
             if deps:
                 # There are still unmet deps
@@ -232,7 +239,7 @@ def revival_worker_method(worker_id, comms, pipe):
             # Listen for announcements that other workers have completed calcualtions and see if any of our tasks depend on them.
             finished_req_id = pipe.recv()
             if DEBUG:
-                comms.toBeLoggedQ.put("[{:s}] {:s} Noticed {:d}".format(time_stanp_str(), str(worker_id), finished_req_id))
+                comms.toBeLoggedQ.put("[{:s}] {:s} Noticed {:s}".format(time_stanp_str(), str(worker_id), str(pickle.loads(finished_req_id))))
             tasks = [update_task(t, finished_req_id) for t in tasks if t is not None]
 
         if not comms.toBeRevivedQ.empty():
@@ -245,17 +252,20 @@ def revival_worker_method(worker_id, comms, pipe):
             else:
                 # We got a new one
                 # Some results could have come in since this was added to the queue, so check now
-                code = tuple(comms.resultsDB[c.req_id] if isinstance(c, NonExistingResult) and c.req_id in comms.resultsDB else c for c in code)
+                code = tuple(pickle.loads(comms.resultsDB.get(c.req_id))
+                             if isinstance(c, NonExistingResult) and comms.resultsDB.exists(c.req_id)
+                             else c
+                             for c in code)
                 deps = {c.req_id for c in code if isinstance(c, NonExistingResult)}
                 if deps:
                     tasks.append(WaitingRequest(deps, req_id, code))
                     if DEBUG:
-                        comms.toBeLoggedQ.put("[{:s}] {:s} Took on {:d} with deps {:s}".format(time_stanp_str(), str(worker_id), req_id, str(deps)))
+                        comms.toBeLoggedQ.put("[{:s}] {:s} Took on {:s} with deps {:s}".format(time_stanp_str(), str(worker_id), str(pickle.loads(req_id)), str(deps)))
                 else:
                     # Everything is actually already ready
                     add_to_be_calculated_queue(comms, req_id, code)
                     if DEBUG:
-                        comms.toBeLoggedQ.put("[{:s}] {:s} {:d} is ready already".format(time_stanp_str(), str(worker_id), req_id))
+                        comms.toBeLoggedQ.put("[{:s}] {:s} {:s} is ready already".format(time_stanp_str(), str(worker_id), str(pickle.loads(req_id))))
 
 
 def report_worker_method(worker_id, comms):
@@ -263,7 +273,7 @@ def report_worker_method(worker_id, comms):
     while True:
         req_id = comms.toBeReportedQ.get()
         # Imagine this getting back to the user somehow
-        comms.toBeLoggedQ.put("[{:s}] {:s} DONE {:d} -> {:s}".format(time_stanp_str(), str(worker_id), req_id, str(comms.resultsDB[req_id])))
+        comms.toBeLoggedQ.put("[{:s}] {:s} DONE {:s} -> {:s}".format(time_stanp_str(), str(worker_id), str(pickle.loads(req_id)), str(pickle.loads(comms.resultsDB.get(req_id)))))
 
 
 def announcement_worker_method(worker_id, comms):
@@ -275,7 +285,7 @@ def announcement_worker_method(worker_id, comms):
         for p in comms.resultSendrs:
             p.send(req_id) # Hope this doesn't block (buffer full)
             if DEBUG:
-                comms.toBeLoggedQ.put("[{:s}] {:s} Announcing {:d}".format(time_stanp_str(), str(worker_id), req_id))
+                comms.toBeLoggedQ.put("[{:s}] {:s} Announcing {:s}".format(time_stanp_str(), str(worker_id), str(pickle.loads(req_id))))
             # A subscription model where only some workers get some messages might be better.
 
 
@@ -302,7 +312,8 @@ def main():
     num_log_workers = 1 # Keep at 1 or print statements will get mixed together
     with mp.Manager() as results_db_mgr:
         result_rcvrs, result_sndrs = zip(*(mp.Pipe() for _ in range(num_revival_workers)))
-        comms = Comms(results_db_mgr.dict(),
+        comms = Comms(#results_db_mgr.dict(),
+                      redis.Redis(host='localhost', port=6379, db=0),
                       mp.Queue(),
                       mp.Queue(),
                       mp.Queue(),
@@ -336,7 +347,7 @@ def main():
                      ('frac', (('evals_to_sum',), 1., 2.), ('prod', 3., 4.)),
                     ]:
             req_id = req_id_from_code(code)
-            comms.toBeLoggedQ.put("User requesting {:d}".format(req_id))
+            comms.toBeLoggedQ.put("User requesting {:s}".format(str(pickle.loads(req_id))))
             add_to_be_calculated_queue(comms, req_id, code)
 
         for w in calculation_workers + [announcement_worker] + report_workers + revival_workers + log_workers:
