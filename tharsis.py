@@ -77,8 +77,8 @@ NonExistingResult = namedtuple('NonExistingResult', ['req_id'])
 WaitingRequest = namedtuple('WaitingRequest', ['deps', 'req_id', 'code'])
 
 Comms = namedtuple('Comms', ['resultsDB',        # Db where results are stored
+                             'resultsPubSub',    # Publishing and subscribing to messages about calculation completion
                              'toBeCalculatedQ',  # Queue for calculations ready to run
-                             'toBeAnnouncedQ',   # Queue for calculations finished which need announcing to other workers
                              'toBeReportedQ',    # Queue for calculations finished which need to be reported to user
                              'toBeRevivedQ',     # Queue for calculations waiting for inputs to be ready
                              'toBeLoggedQ',      # Queue for messages to be logged
@@ -97,9 +97,9 @@ def add_to_be_revived_queue(comms, req_id, code):
         raise ValueError()
     comms.toBeRevivedQ.put((req_id, code))
 
-def add_to_be_announced_queue(comms, req_id):
+def publish_calc_completed(comms, req_id):
     '''Centralized method for adding to queue. For sanity checks and logs.'''
-    comms.toBeAnnouncedQ.put(req_id)
+    comms.resultsDB.publish('calc-completed', req_id)
 
 def add_to_be_reported_queue(comms, req_id):
     '''Centralized method for adding to queue. For sanity checks and logs.'''
@@ -197,7 +197,7 @@ def calculation_worker_method(worker_id, comms):
                 res = Language.eval(code)
                 comms.resultsDB.set(req_id, pickle.dumps(res))
                 add_to_be_reported_queue(comms, req_id)
-                add_to_be_announced_queue(comms, req_id)
+                publish_calc_completed(comms, req_id)
                 if DEBUG:
                     comms.toBeLoggedQ.put('[{:s}] {:s} completed {:s} -> {:s}'.format(time_stanp_str(), str(worker_id), str(pickle.loads(req_id)), str(res)))
             else:
@@ -215,6 +215,8 @@ def revival_worker_method(worker_id, comms, pipe):
     # Questionable method
     tasks = []
 
+    comms.resultsPubSub.subscribe('calc-completed')
+    
     def update_task(task, finished_req_id):
         '''Update one sub-task based on knowledge of new finished_req_id'''
         if finished_req_id not in task.deps:
@@ -235,13 +237,14 @@ def revival_worker_method(worker_id, comms, pipe):
                 return None
 
     while True:
-        if pipe.poll():
-            # Listen for announcements that other workers have completed calcualtions and see if any of our tasks depend on them.
-            finished_req_id = pipe.recv()
+        psm = comms.resultsPubSub.get_message()
+        if psm and psm['type'] == 'message':
+            #print("Got message", pickle.loads(psm['data']) )
+            finished_req_id = psm['data']
             if DEBUG:
                 comms.toBeLoggedQ.put("[{:s}] {:s} Noticed {:s}".format(time_stanp_str(), str(worker_id), str(pickle.loads(finished_req_id))))
             tasks = [update_task(t, finished_req_id) for t in tasks if t is not None]
-
+            
         if not comms.toBeRevivedQ.empty():
             # Watch for new tasks for us to manage
             # Docs say empty() is unreliable so we still could get an exception
@@ -276,19 +279,6 @@ def report_worker_method(worker_id, comms):
         comms.toBeLoggedQ.put("[{:s}] {:s} DONE {:s} -> {:s}".format(time_stanp_str(), str(worker_id), str(pickle.loads(req_id)), str(pickle.loads(comms.resultsDB.get(req_id)))))
 
 
-def announcement_worker_method(worker_id, comms):
-    '''Announce results to other workers'''
-    # Exclusive writer to the result announcing pipes. Exactly one of these. Must be quick.
-    # Questionable method
-    while True:
-        req_id = comms.toBeAnnouncedQ.get()
-        for p in comms.resultSendrs:
-            p.send(req_id) # Hope this doesn't block (buffer full)
-            if DEBUG:
-                comms.toBeLoggedQ.put("[{:s}] {:s} Announcing {:s}".format(time_stanp_str(), str(worker_id), str(pickle.loads(req_id))))
-            # A subscription model where only some workers get some messages might be better.
-
-
 def log_worker_method(worker_id, comms):
     '''Code for the log workers'''
     _ = worker_id # This would matter if we had more than one
@@ -311,8 +301,10 @@ def main():
     num_revival_workers = 2
     num_log_workers = 1 # Keep at 1 or print statements will get mixed together
     result_rcvrs, result_sndrs = zip(*(mp.Pipe() for _ in range(num_revival_workers)))
-    comms = Comms(redis.Redis(host='localhost', port=6379, db=0),
-                  mp.Queue(),
+    resultsDB = redis.Redis(host='localhost', port=6379, db=0)
+    
+    comms = Comms(resultsDB,
+                  resultsDB.pubsub(ignore_subscribe_messages=True),
                   mp.Queue(),
                   mp.Queue(),
                   mp.Queue(),
@@ -323,10 +315,6 @@ def main():
     for w in calculation_workers:
         w.start()
         
-    # Only one allowed with the way we are using pipes
-    announcement_worker = mp.Process(target=announcement_worker_method, args=((0, 'A'), comms))
-    announcement_worker.start()
-    
     report_workers = [mp.Process(target=report_worker_method, args=((i, 'R'), comms)) for i in range(num_report_workers)]
     for w in report_workers:
         w.start()
@@ -348,7 +336,7 @@ def main():
         comms.toBeLoggedQ.put("User requesting {:s}".format(str(pickle.loads(req_id))))
         add_to_be_calculated_queue(comms, req_id, code)
         
-    for w in calculation_workers + [announcement_worker] + report_workers + revival_workers + log_workers:
+    for w in calculation_workers + report_workers + revival_workers + log_workers:
         w.join()
 
 if __name__ == '__main__':
