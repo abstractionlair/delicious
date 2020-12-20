@@ -310,48 +310,46 @@ def main():
     num_report_workers = 2
     num_revival_workers = 2
     num_log_workers = 1 # Keep at 1 or print statements will get mixed together
-    with mp.Manager() as results_db_mgr:
-        result_rcvrs, result_sndrs = zip(*(mp.Pipe() for _ in range(num_revival_workers)))
-        comms = Comms(#results_db_mgr.dict(),
-                      redis.Redis(host='localhost', port=6379, db=0),
-                      mp.Queue(),
-                      mp.Queue(),
-                      mp.Queue(),
-                      mp.Queue(),
-                      mp.Queue(),
-                      result_sndrs)
+    result_rcvrs, result_sndrs = zip(*(mp.Pipe() for _ in range(num_revival_workers)))
+    comms = Comms(redis.Redis(host='localhost', port=6379, db=0),
+                  mp.Queue(),
+                  mp.Queue(),
+                  mp.Queue(),
+                  mp.Queue(),
+                  mp.Queue(),
+                  result_sndrs)
+    
+    calculation_workers = [mp.Process(target=calculation_worker_method, args=((i, 'C'), comms)) for i in range(num_calc_workers)]
+    for w in calculation_workers:
+        w.start()
+        
+    # Only one allowed with the way we are using pipes
+    announcement_worker = mp.Process(target=announcement_worker_method, args=((0, 'A'), comms))
+    announcement_worker.start()
+    
+    report_workers = [mp.Process(target=report_worker_method, args=((i, 'R'), comms)) for i in range(num_report_workers)]
+    for w in report_workers:
+        w.start()
+        
+    revival_workers = [mp.Process(target=revival_worker_method, args=((i, 'V'), comms, pipe)) for i, pipe in enumerate(result_rcvrs)]
+    for w in revival_workers:
+        w.start()
 
-        calculation_workers = [mp.Process(target=calculation_worker_method, args=((i, 'C'), comms)) for i in range(num_calc_workers)]
-        for w in calculation_workers:
-            w.start()
+    log_workers = [mp.Process(target=log_worker_method, args=((i, 'L'), comms)) for i in range(num_log_workers)]
+    for w in log_workers:
+        w.start()
 
-        # Only one allowed with the way we are using pipes
-        announcement_worker = mp.Process(target=announcement_worker_method, args=((0, 'A'), comms))
-        announcement_worker.start()
-
-        report_workers = [mp.Process(target=report_worker_method, args=((i, 'R'), comms)) for i in range(num_report_workers)]
-        for w in report_workers:
-            w.start()
-
-        revival_workers = [mp.Process(target=revival_worker_method, args=((i, 'V'), comms, pipe)) for i, pipe in enumerate(result_rcvrs)]
-        for w in revival_workers:
-            w.start()
-
-        log_workers = [mp.Process(target=log_worker_method, args=((i, 'L'), comms)) for i in range(num_log_workers)]
-        for w in log_workers:
-            w.start()
-
-        for code in [('sum', 1, ('prod', 2, 3)),
-                     ('frac', 1, 2, 3, 4),
-                     ('frac', ('sum', 1., 2.), ('prod', 3., 4.)),
-                     ('frac', (('evals_to_sum',), 1., 2.), ('prod', 3., 4.)),
-                    ]:
-            req_id = req_id_from_code(code)
-            comms.toBeLoggedQ.put("User requesting {:s}".format(str(pickle.loads(req_id))))
-            add_to_be_calculated_queue(comms, req_id, code)
-
-        for w in calculation_workers + [announcement_worker] + report_workers + revival_workers + log_workers:
-            w.join()
+    for code in [('sum', 1, ('prod', 2, 3)),
+                 ('frac', 1, 2, 3, 4),
+                 ('frac', ('sum', 1., 2.), ('prod', 3., 4.)),
+                 ('frac', (('evals_to_sum',), 1., 2.), ('prod', 3., 4.)),
+                ]:
+        req_id = req_id_from_code(code)
+        comms.toBeLoggedQ.put("User requesting {:s}".format(str(pickle.loads(req_id))))
+        add_to_be_calculated_queue(comms, req_id, code)
+        
+    for w in calculation_workers + [announcement_worker] + report_workers + revival_workers + log_workers:
+        w.join()
 
 if __name__ == '__main__':
     main()
