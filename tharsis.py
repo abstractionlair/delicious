@@ -57,6 +57,8 @@ import queue
 # affinity matter.
 
 
+DEBUG=False
+
 #-------------------------------------------------------------------------------
 
 def timeStampStr():
@@ -146,7 +148,7 @@ def calculationWorkerMethod( workerID, comms):
                 comms.resultsDB[reqID] = res
                 comms.toBeReportedQ.put( reqID )
                 comms.toBeAnnouncedQ.put( reqID )
-                #comms.toBeLoggedQ.put('[{:s}] {:s} completed {:x} -> {:s}'.format(timeStampStr(), str(workerID), reqID, str(res)))
+                if DEBUG: comms.toBeLoggedQ.put('[{:s}] {:s} completed {:x} -> {:s}'.format(timeStampStr(), str(workerID), reqID, str(res)))
             elif any( isinstance(c, tuple) for c in code ):
                 # We have sub-code to evaluate
                 newCode = []
@@ -165,14 +167,14 @@ def calculationWorkerMethod( workerID, comms):
                         newCode.append(c)
                 # Preserve already existing ID. Which is now no longer aligned with hash.
                 comms.toBeRevivedQ.put((reqID, tuple(newCode)))
-                #comms.toBeLoggedQ.put('[{:s}] {:s} sending {:x} to toBeRevivedQ.'.format(timeStampStr(), str(workerID), reqID))
+                if DEBUG: comms.toBeLoggedQ.put('[{:s}] {:s} sending {:x} to toBeRevivedQ.'.format(timeStampStr(), str(workerID), reqID))
             else:
                 # No sub-code, just evaluate.
                 res = Language.eval([ resultsDB[c.reqID] if isinstance(c, NonExistingResult) else c for c in code ])
                 comms.resultsDB[ reqID ] = res
                 comms.toBeReportedQ.put( reqID )
                 comms.toBeAnnouncedQ.put( reqID )
-                #comms.toBeLoggedQ.put('[{:s}] {:s} completed {:x} -> {:s}'.format(timeStampStr(), str(workerID), reqID, str(res)))
+                if DEBUG: comms.toBeLoggedQ.put('[{:s}] {:s} completed {:x} -> {:s}'.format(timeStampStr(), str(workerID), reqID, str(res)))
 
 
 def reportWorkerMethod( workerID, comms ):
@@ -180,7 +182,7 @@ def reportWorkerMethod( workerID, comms ):
     while True:
         reqID = comms.toBeReportedQ.get()
         # Imagine this getting back to the user somehow
-        comms.toBeLoggedQ.put("[{:s}] {:s} DONE {:x}".format(timeStampStr(), str(workerID), reqID))
+        comms.toBeLoggedQ.put("[{:s}] {:s} DONE {:x} -> {:s}".format(timeStampStr(), str(workerID), reqID, str(comms.resultsDB[reqID])))
 
 def announcementWorkerMethod(workerID, comms):
     '''Announce results to other workers'''
@@ -190,7 +192,7 @@ def announcementWorkerMethod(workerID, comms):
         reqID = comms.toBeAnnouncedQ.get()
         for pe in comms.resultSendrs:
             pe.send(reqID) # Hope this doesn't block (buffer full)
-            #comms.toBeLoggedQ.put("[{:s}] {:s} Announcing {:x}".format(timeStampStr(), str(workerID), reqID))
+            if DEBUG: comms.toBeLoggedQ.put("[{:s}] {:s} Announcing {:x}".format(timeStampStr(), str(workerID), reqID))
             # A subscription model where only some workers get some messages might be better.
 
 def revivalWorkerMethod(workerID, comms, pipeEnd):
@@ -218,7 +220,7 @@ def revivalWorkerMethod(workerID, comms, pipeEnd):
         if pipeEnd.poll():
             # Listen for announcements that other workers have completed calcualtions and see if any of our tasks depend on them.
             finishedReqID = pipeEnd.recv()
-            #comms.toBeLoggedQ.put("[{:s}] {:s} Noticed {:x}".format(timeStampStr(), str(workerID), finishedReqID))
+            if DEBUG: comms.toBeLoggedQ.put("[{:s}] {:s} Noticed {:x}".format(timeStampStr(), str(workerID), finishedReqID))
             tasks = [updateTask(t, finishedReqID) for t in tasks if t is not None]
 
         if not comms.toBeRevivedQ.empty():
@@ -231,11 +233,17 @@ def revivalWorkerMethod(workerID, comms, pipeEnd):
             else:
                 # We got a new one
                 # Some results could have come in since this was added to the queue, so check now
-                code = [comms.resultsDB[c.reqID] if isinstance(c, NonExistingResult) and c.reqID == finishedReqID else c for c in code]
+                code = [comms.resultsDB[c.reqID] if isinstance(c, NonExistingResult) and c.reqID in comms.resultsDB else c for c in code]
                 deps = set((c.reqID for c in code if isinstance(c, NonExistingResult)))
-                newTask = WaitingRequest(deps, reqID, code)
-                tasks.append(newTask)
-                #comms.toBeLoggedQ.put("[{:s}] {:s} Took on {:x} with deps {:s}".format(timeStampStr(), str(workerID), reqID, str(deps)))
+                if deps:
+                    newTask = WaitingRequest(deps, reqID, code)
+                    tasks.append(newTask)
+                    if DEBUG: comms.toBeLoggedQ.put("[{:s}] {:s} Took on {:x} with deps {:s}".format(timeStampStr(), str(workerID), reqID, str(deps)))
+                else:
+                    # Everything is actually already ready
+                    comms.toBeCalculatedQ.put( (reqID, code) )
+                    if DEBUG: comms.toBeLoggedQ.put("[{:s}] {:s} {:x} is ready already".format(timeStampStr(), str(workerID), reqID))
+
 
 def logWorkerMethod( workerID, comms ):
     while True:
