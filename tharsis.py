@@ -84,19 +84,23 @@ Comms = namedtuple('Comms', ['resultsDB',        # Db where results are stored
                             ])
 
 def add_to_be_calculated_queue(comms, req_id, code):
+    '''Centralized method for adding to queue. For sanity checks and logs.'''
     if not isinstance(code, tuple):# or isinstance(code, list)):
-        raise(ValueError())
+        raise ValueError()
     comms.toBeCalculatedQ.put((req_id, code))
 
 def add_to_be_revived_queue(comms, req_id, code):
+    '''Centralized method for adding to queue. For sanity checks and logs.'''
     if not isinstance(code, tuple):# or isinstance(code, list)):
-        raise(ValueError())
+        raise ValueError()
     comms.toBeRevivedQ.put((req_id, code))
 
 def add_to_be_announced_queue(comms, req_id):
+    '''Centralized method for adding to queue. For sanity checks and logs.'''
     comms.toBeAnnouncedQ.put(req_id)
 
 def add_to_be_reported_queue(comms, req_id):
+    '''Centralized method for adding to queue. For sanity checks and logs.'''
     comms.toBeReportedQ.put(req_id)
 
 #-------------------------------------------------------------------------------
@@ -106,29 +110,39 @@ class Language():
     '''We're onlly going to have built in functions or forms.'''
 
     class SpecialForms():
+        '''Don't evaluate arguments first'''
+
         @staticmethod
         def quote(arg):
+            '''Protect arg from evaluation. Suppose you wanted to use a tuple as data rather than as a function call indicator.'''
             return arg
 
     class Functions():
+        '''Normal functions'''
+
         @staticmethod
         def sum(*args):
+            '''add things'''
             return functools.reduce(operator.add, args, 0.)
 
         @staticmethod
         def diff(*args):
+            '''subtrtact things'''
             return functools.reduce(operator.sub, args, 0.)
 
         @staticmethod
         def prod(*args):
+            '''multiply things'''
             return functools.reduce(operator.mul, args, 1.)
 
         @staticmethod
         def frac(*args):
+            '''divide things'''
             return functools.reduce(operator.truediv, args, 1.)
 
         @staticmethod
-        def evalsToSum():
+        def evals_to_sum():
+            '''Demo to show indirection works'''
             return 'sum'
 
     @staticmethod
@@ -149,7 +163,7 @@ class Language():
 #-------------------------------------------------------------------------------
 # Workers
 
-def calculationWorkerMethod(workerID, comms):
+def calculation_worker_method(worker_id, comms):
     '''Code for the calculation workers'''
     # NOTE: A request shouldn't be revived unless _all_ inputs are ready. So we won't attempt to handle partial results here.
 
@@ -160,13 +174,13 @@ def calculationWorkerMethod(workerID, comms):
             return code
         else:
             # Nested function call
-            childReqID = req_id_from_code(code)
-            if childReqID not in comms.resultsDB:
+            child_req_id = req_id_from_code(code)
+            if child_req_id not in comms.resultsDB:
                 # TODO: segment functions into ones meant to be distributed and ones meant to run locally then branch here.
-                add_to_be_calculated_queue(comms, childReqID, code)
-                return NonExistingResult(childReqID)
+                add_to_be_calculated_queue(comms, child_req_id, code)
+                return NonExistingResult(child_req_id)
             else:
-                return comms.resultsDB[childReqID]
+                return comms.resultsDB[child_req_id]
 
     while True:
         req_id, code = comms.toBeCalculatedQ.get()
@@ -175,34 +189,34 @@ def calculationWorkerMethod(workerID, comms):
             if not any(isinstance(c, tuple) for c in code):
                 # No sub-code, just evaluate.
                 # Fill in any references to the results DB
-                newCode = tuple(resultsDB[c.req_id] if isinstance(c, NonExistingResult) else c for c in code)
-                res = Language.eval(newCode)
+                code = tuple(comms.resultsDB[c.req_id] if isinstance(c, NonExistingResult) else c for c in code)
+                res = Language.eval(code)
                 comms.resultsDB[req_id] = res
-                add_to_be_reported_queue(comms,req_id)
-                add_to_be_announced_queue(comms,req_id)
+                add_to_be_reported_queue(comms, req_id)
+                add_to_be_announced_queue(comms, req_id)
                 if DEBUG:
-                    comms.toBeLoggedQ.put('[{:s}] {:s} completed {:d} -> {:s}'.format(time_stanp_str(), str(workerID), req_id, str(res)))
+                    comms.toBeLoggedQ.put('[{:s}] {:s} completed {:d} -> {:s}'.format(time_stanp_str(), str(worker_id), req_id, str(res)))
             else:
                 # We have sub-code to evaluate
                 # Fill in any references to the results DB
-                newCode = tuple(comms.resultsDB[c.req_id] if isinstance(c, NonExistingResult) else c for c in code)
-                newCode = tuple(process_nested(c) for c in newCode)
-                add_to_be_revived_queue(comms, req_id, tuple(newCode))
+                code = tuple(comms.resultsDB[c.req_id] if isinstance(c, NonExistingResult) else c for c in code)
+                code = tuple(process_nested(c) for c in code)
+                add_to_be_revived_queue(comms, req_id, tuple(code))
                 if DEBUG:
-                    comms.toBeLoggedQ.put('[{:s}] {:s} sending {:d} to toBeRevivedQ.'.format(time_stanp_str(), str(workerID), req_id))
+                    comms.toBeLoggedQ.put('[{:s}] {:s} sending {:d} to toBeRevivedQ.'.format(time_stanp_str(), str(worker_id), req_id))
 
 
-def revivalWorkerMethod(workerID, comms, pipeEnd):
+def revival_worker_method(worker_id, comms, pipe):
     '''Restart calculations which were on hold waiting for inputs'''
     # Questionable method
     tasks = []
 
-    def updateTask(task, finishedReqID):
-        '''Update one sub-task based on knowledge of new finishedReqID'''
-        if finishedReqID not in task.deps:
+    def update_task(task, finished_req_id):
+        '''Update one sub-task based on knowledge of new finished_req_id'''
+        if finished_req_id not in task.deps:
             return task
         else:
-            # Fill in any results we can find in the db, including ones other than finishedReqID. Why wait if they are available?
+            # Fill in any results we can find in the db, including ones other than finished_req_id. Why wait if they are available?
             code = tuple(comms.resultsDB[c.req_id] if isinstance(c, NonExistingResult) else c for c in task.code)
             deps = {c.req_id for c in code if isinstance(c, NonExistingResult)}
             if deps:
@@ -214,12 +228,12 @@ def revivalWorkerMethod(workerID, comms, pipeEnd):
                 return None
 
     while True:
-        if pipeEnd.poll():
+        if pipe.poll():
             # Listen for announcements that other workers have completed calcualtions and see if any of our tasks depend on them.
-            finishedReqID = pipeEnd.recv()
+            finished_req_id = pipe.recv()
             if DEBUG:
-                comms.toBeLoggedQ.put("[{:s}] {:s} Noticed {:d}".format(time_stanp_str(), str(workerID), finishedReqID))
-            tasks = [updateTask(t, finishedReqID) for t in tasks if t is not None]
+                comms.toBeLoggedQ.put("[{:s}] {:s} Noticed {:d}".format(time_stanp_str(), str(worker_id), finished_req_id))
+            tasks = [update_task(t, finished_req_id) for t in tasks if t is not None]
 
         if not comms.toBeRevivedQ.empty():
             # Watch for new tasks for us to manage
@@ -236,36 +250,38 @@ def revivalWorkerMethod(workerID, comms, pipeEnd):
                 if deps:
                     tasks.append(WaitingRequest(deps, req_id, code))
                     if DEBUG:
-                        comms.toBeLoggedQ.put("[{:s}] {:s} Took on {:d} with deps {:s}".format(time_stanp_str(), str(workerID), req_id, str(deps)))
+                        comms.toBeLoggedQ.put("[{:s}] {:s} Took on {:d} with deps {:s}".format(time_stanp_str(), str(worker_id), req_id, str(deps)))
                 else:
                     # Everything is actually already ready
                     add_to_be_calculated_queue(comms, req_id, code)
                     if DEBUG:
-                        comms.toBeLoggedQ.put("[{:s}] {:s} {:d} is ready already".format(time_stanp_str(), str(workerID), req_id))
+                        comms.toBeLoggedQ.put("[{:s}] {:s} {:d} is ready already".format(time_stanp_str(), str(worker_id), req_id))
 
-                        
-def reportWorkerMethod(workerID, comms):
+
+def report_worker_method(worker_id, comms):
     '''Report result to end user'''
     while True:
         req_id = comms.toBeReportedQ.get()
         # Imagine this getting back to the user somehow
-        comms.toBeLoggedQ.put("[{:s}] {:s} DONE {:d} -> {:s}".format(time_stanp_str(), str(workerID), req_id, str(comms.resultsDB[req_id])))
+        comms.toBeLoggedQ.put("[{:s}] {:s} DONE {:d} -> {:s}".format(time_stanp_str(), str(worker_id), req_id, str(comms.resultsDB[req_id])))
 
-        
-def announcementWorkerMethod(workerID, comms):
+
+def announcement_worker_method(worker_id, comms):
     '''Announce results to other workers'''
     # Exclusive writer to the result announcing pipes. Exactly one of these. Must be quick.
     # Questionable method
     while True:
         req_id = comms.toBeAnnouncedQ.get()
-        for pe in comms.resultSendrs:
-            pe.send(req_id) # Hope this doesn't block (buffer full)
+        for p in comms.resultSendrs:
+            p.send(req_id) # Hope this doesn't block (buffer full)
             if DEBUG:
-                comms.toBeLoggedQ.put("[{:s}] {:s} Announcing {:d}".format(time_stanp_str(), str(workerID), req_id))
+                comms.toBeLoggedQ.put("[{:s}] {:s} Announcing {:d}".format(time_stanp_str(), str(worker_id), req_id))
             # A subscription model where only some workers get some messages might be better.
-            
 
-def logWorkerMethod(workerID, comms):
+
+def log_worker_method(worker_id, comms):
+    '''Code for the log workers'''
+    _ = worker_id # This would matter if we had more than one
     while True:
         msg = comms.toBeLoggedQ.get()
         print(msg)
@@ -279,54 +295,51 @@ def logWorkerMethod(workerID, comms):
 # Example
 
 def main():
-    nCalculationWorkers = 4
-    nReportWorkers = 2
-    nRevivalWorkers = 2
-    nLogWorkers = 1 # Keep at 1 or print statements will get mixed together
-    with mp.Manager() as resultsDBMgr:
-        resultsDB = resultsDBMgr.dict()
-        toBeCalculatedQ = mp.Queue()
-        toBeAnnouncedQ = mp.Queue()
-        toBeReportedQ = mp.Queue()
-        toBeRevivedQ = mp.Queue()
-        toBeLoggedQ = mp.Queue()
-        resultRecvrs, resultSendrs = zip(*(mp.Pipe() for _ in range(nRevivalWorkers)))
+    '''Main as a real function'''
+    num_calc_workers = 4
+    num_report_workers = 2
+    num_revival_workers = 2
+    num_log_workers = 1 # Keep at 1 or print statements will get mixed together
+    with mp.Manager() as results_db_mgr:
+        result_rcvrs, result_sndrs = zip(*(mp.Pipe() for _ in range(num_revival_workers)))
+        comms = Comms(results_db_mgr.dict(),
+                      mp.Queue(),
+                      mp.Queue(),
+                      mp.Queue(),
+                      mp.Queue(),
+                      mp.Queue(),
+                      result_sndrs)
 
-        comms = Comms(resultsDB,
-                      toBeCalculatedQ,
-                      toBeAnnouncedQ,
-                      toBeReportedQ,
-                      toBeRevivedQ,
-                      toBeLoggedQ,
-                      resultSendrs)
+        calculation_workers = [mp.Process(target=calculation_worker_method, args=((i, 'C'), comms)) for i in range(num_calc_workers)]
+        for w in calculation_workers:
+            w.start()
 
-        calculationWorkers = [mp.Process(target=calculationWorkerMethod, args=((i, 'C'), comms)) for i in range(nCalculationWorkers)]
-        for w in calculationWorkers: w.start()
+        # Only one allowed with the way we are using pipes
+        announcement_worker = mp.Process(target=announcement_worker_method, args=((0, 'A'), comms))
+        announcement_worker.start()
 
-        announcementWorker = mp.Process(target=announcementWorkerMethod, args=((0, 'A'), comms))
-        announcementWorker.start()
+        report_workers = [mp.Process(target=report_worker_method, args=((i, 'R'), comms)) for i in range(num_report_workers)]
+        for w in report_workers:
+            w.start()
 
-        reportWorkers = [mp.Process(target=reportWorkerMethod, args=((i, 'R'), comms)) for i in range(nReportWorkers)]
-        for w in reportWorkers: w.start()
+        revival_workers = [mp.Process(target=revival_worker_method, args=((i, 'V'), comms, pipe)) for i, pipe in enumerate(result_rcvrs)]
+        for w in revival_workers:
+            w.start()
 
-        revivalWorkers = [mp.Process(target=revivalWorkerMethod, args=((i, 'V'), comms, pipeEnd)) for i, pipeEnd in enumerate(resultRecvrs)]
-        for w in revivalWorkers: w.start()
-
-        logWorkers = [mp.Process(target=logWorkerMethod, args=((i, 'L'), comms)) for i in range(nRevivalWorkers)]
-        for w in logWorkers: w.start()
+        log_workers = [mp.Process(target=log_worker_method, args=((i, 'L'), comms)) for i in range(num_log_workers)]
+        for w in log_workers:
+            w.start()
 
         for code in [('sum', 1, ('prod', 2, 3)),
                      ('frac', 1, 2, 3, 4),
                      ('frac', ('sum', 1., 2.), ('prod', 3., 4.)),
-                     ('frac', (('evalsToSum',), 1., 2.), ('prod', 3., 4.)),
+                     ('frac', (('evals_to_sum',), 1., 2.), ('prod', 3., 4.)),
                     ]:
             req_id = req_id_from_code(code)
-            toBeLoggedQ.put("User requesting {:d}".format(req_id))
-            #toBeCalculatedQ.put((req_id, code))
+            comms.toBeLoggedQ.put("User requesting {:d}".format(req_id))
             add_to_be_calculated_queue(comms, req_id, code)
 
-
-        for w in calculationWorkers + [announcementWorker] + reportWorkers + revivalWorkers + logWorkers:
+        for w in calculation_workers + [announcement_worker] + report_workers + revival_workers + log_workers:
             w.join()
 
 if __name__ == '__main__':
