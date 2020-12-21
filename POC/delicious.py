@@ -1,17 +1,17 @@
 '''
-User sends request in the form of an _expression_ in code or a data structure equivalent to code.
-E.g. f( g(), (h( i(), j(), const(2))).
+Initial ideas. Not up to date with code below.
+
+User sends request in the form of an _expression_ in a data structure equivalent to code.
+E.g. (f, (g,), ((h, (i,), (j,), (const, 2))).
 Must be composed entirely of pure functions or functions which rely only on immutable external data.
 So results can be cached.
 
 Receiving service translates it into something that is added to the Ready queue.
-    (Said something has an identifier corresponding to the code.)
     Then waits for a result _somehow_.
     Then returns result to the user.
     Might be better to return some key and let the user subscribe to
-    notifications of completed computations? Then  have a second service
+    notifications of completed computations? Then have a second service
     for retrieving results given the key.
-
 
 A ready-queue worker picks it up from the Ready queue.
     ? Can we work in affinity here?
@@ -21,10 +21,9 @@ A ready-queue worker picks it up from the Ready queue.
         The worker executes it;
         writes the result to the Results DB;
         adds a Done message to the Done queue;
-        if the call was from the receiving service, signals the receiver that it was done;
         removes the item from the Ready queue.
     If the call has arguments which are unevaluated nested function calls:
-        The worker adds evaluations of the nested functions to the Ready queue;
+        The worker adds evaluations of the nested functions to the Ready queue;        
         adds an item to the Waiting queue/map for evaluating the call w/ evaluated nested arge to the Waiting queue;
         removes the item from the Ready queue.
     If the call has arguments and all have been evaluated:
@@ -35,7 +34,8 @@ A ready-queue worker picks it up from the Ready queue.
         if the call was from the receiving service, signals the receiver that it was done;
         removes the item from the Ready queue.
 
-Recursively we will eventually get down to pure function calls. (Constants considered a special case of pure functions.)
+Recursively we will eventually get down to function calls without arguments.
+(Constants considered a special case of functions with no arguments.)
 
 A done-queue worker picks up a result from the Done queue.
     The worker examines the waiting queue/map for calculations waiting for this result.
