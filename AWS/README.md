@@ -13,8 +13,12 @@ Rounding to be conservative
 
 This seems like a bad fit for the *back and forth* message passing I have in mind.
 
+
+What to cache / distribute
+==========================
 We could divide functions into categories like
 1. Short: just calculate in process.
 2. Medium: worth distributing / caching on the same machine
 3. Long: worth distributing / caching across machines
 
+Within the in-process domain, it would also be nice to do db-read batching.
