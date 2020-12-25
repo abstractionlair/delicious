@@ -23,7 +23,7 @@ A ready-queue worker picks it up from the Ready queue.
         adds a Done message to the Done queue;
         removes the item from the Ready queue.
     If the call has arguments which are unevaluated nested function calls:
-        The worker adds evaluations of the nested functions to the Ready queue;        
+        The worker adds evaluations of the nested functions to the Ready queue;
         adds an item to the Waiting queue/map for evaluating the call w/ evaluated nested arge to the Waiting queue;
         removes the item from the Ready queue.
     If the call has arguments and all have been evaluated:
@@ -70,64 +70,74 @@ DEBUG = False
 
 class Language():
     '''We're onlly going to have built in functions or forms.'''
-    
-    def __init__( self,
-                  num_calc_workers = 4,
-                  num_report_workers = 2,
-                  num_revival_workers = 2,
-                  num_log_workers = 1 # Keep at 1 for now or print statements will get mixed together
-    ):
+
+    def __init__(self,
+                 num_calc_workers=4,
+                 num_report_workers=2,
+                 num_revival_workers=2,
+                 num_log_workers=1 # Keep at 1 for now or print statements will get mixed together
+                ):
         results_db = redis.Redis(host='localhost', port=6379, db=0)
-        self.comms = _Comms(results_db,
-                            results_db.pubsub(ignore_subscribe_messages=True),
-                            mp.Queue(),
-                            mp.Queue(),
-                            mp.Queue(),
-                            mp.Queue())
+        self.comms = Language.Comms(results_db,
+                                    results_db.pubsub(ignore_subscribe_messages=True),
+                                    mp.Queue(),
+                                    mp.Queue(),
+                                    mp.Queue(),
+                                    mp.Queue())
 
         self.calculation_workers = [mp.Process(target=self._calculation_worker_method, args=((i, 'C'), self.comms)) for i in range(num_calc_workers)]
         for w in self.calculation_workers:
             w.start()
-            print('started', w )
-            
+            print('started', w)
+
         self.report_workers = [mp.Process(target=self._report_worker_method, args=((i, 'R'), self.comms)) for i in range(num_report_workers)]
         for w in self.report_workers:
             w.start()
-            print('started', w )
-                
+            print('started', w)
+
         self.revival_workers = [mp.Process(target=self._revival_worker_method, args=((i, 'V'), self.comms)) for i in range(num_revival_workers)]
         for w in self.revival_workers:
             w.start()
-            print('started', w )
-                    
+            print('started', w)
+
         self.log_workers = [mp.Process(target=self._log_worker_method, args=((i, 'L'), self.comms)) for i in range(num_log_workers)]
         for w in self.log_workers:
             w.start()
-            print('started', w )
+            print('started', w)
 
-    def join( self ):
+    def join(self):
+        '''Join to worker processes'''
         for w in self.calculation_workers + self.report_workers + self.revival_workers + self.log_workers:
+            print('joining to', w)
             w.join()
-            print('joined to', w)
 
     def request_calc(self, code):
         '''Centralized method for adding to queue. For sanity checks and logs.'''
         if not isinstance(code, tuple):
             raise ValueError()
         req_id = _req_id_from_code(code)
-        Language._to_be_calculated_queue_add(self.comms, req_id, code)
+        Language._to_be_calculated_queue_long_add(self.comms, req_id, code)
         self.comms.toBeLoggedQ.put('[{:s}] user requested {:s}'.format(_time_stamp_str(), str(pickle.loads(req_id))))
         return req_id
 
     #-------------------------------------------------------------------------------
     # Workers and other innards
 
+    # The package of connections and such passed to each worker.
+    Comms = namedtuple('Comms', ['resultsDB',        # Db where results are stored
+                                 'resultsPubSub',    # Publishing and subscribing to messages about calculation completion
+                                 'toBeCalculatedLongQ',  # Queue for calculations ready to run
+                                 'toBeReportedQ',    # Queue for calculations finished which need to be reported to user
+                                 'toBeRevivedQ',     # Queue for calculations waiting for inputs to be ready
+                                 'toBeLoggedQ',      # Queue for messages to be logged
+                                ])
+
     @staticmethod
-    def _to_be_calculated_queue_add(comms, req_id, code):
+    def _to_be_calculated_queue_long_add(comms, req_id, code):
         '''Centralized method for adding to queue. For sanity checks and logs.'''
         if not isinstance(code, tuple):
             raise ValueError()
-        comms.toBeCalculatedQ.put((req_id, code))
+        comms.toBeCalculatedLongQ.put((req_id, code))
 
     @staticmethod
     def _to_be_revived_queue_add(comms, req_id, code):
@@ -144,13 +154,13 @@ class Language():
     @staticmethod
     def _to_be_reported_queue_add(comms, req_id):
         '''Centralized method for adding to queue. For sanity checks and logs.'''
-        comms.toBeReportedQ.put(req_id)    
-    
+        comms.toBeReportedQ.put(req_id)
+
     @staticmethod
     def _calculation_worker_method(worker_id, comms):
         '''Code for the calculation workers'''
         # NOTE: A request shouldn't be revived unless _all_ inputs are ready. So we won't attempt to handle partial results here.
-        
+
         def process_nested(code):
             '''handles one argument'''
             if not isinstance(code, tuple):
@@ -165,38 +175,43 @@ class Language():
                     return child_res
                 else:
                     # TODO: segment functions into ones meant to be distributed and ones meant to run locally then branch here.
-                    Language._to_be_calculated_queue_add(comms, child_req_id, code)
-                    return _NonExistingResult(child_req_id)
-                
+                    Language._to_be_calculated_queue_long_add(comms, child_req_id, code)
+                    return _PendingResultLong(child_req_id)
+
         while True:
-            req_id, code = comms.toBeCalculatedQ.get()
+            req_id, code = comms.toBeCalculatedLongQ.get()
             if not comms.resultsDB.exists(req_id):
                 # If it was in the db there'd be nothing for us to do
                 if not any(isinstance(c, tuple) for c in code):
                     # No sub-code, just evaluate.
                     # Fill in any references to the results DB
-                    code = tuple(pickle.loads(comms.resultsDB.get(c.req_id)) if isinstance(c, _NonExistingResult) else c for c in code)
+                    code = tuple(pickle.loads(comms.resultsDB.get(c.req_id)) if isinstance(c, _PendingResultLong) else c for c in code)
                     res = Language.eval(code)
                     comms.resultsDB.set(req_id, pickle.dumps(res))
                     Language._to_be_reported_queue_add(comms, req_id)
                     Language._publish_calc_completed(comms, req_id)
                     if DEBUG:
-                        comms.toBeLoggedQ.put('[{:s}] {:s} completed {:s} -> {:s}'.format(_time_stamp_str(), str(worker_id), str(pickle.loads(req_id)), str(res)))
+                        comms.toBeLoggedQ.put('[{:s}] {:s} completed {:s} -> {:s}'.format(_time_stamp_str(),
+                                                                                          str(worker_id),
+                                                                                          str(pickle.loads(req_id)),
+                                                                                          str(res)))
                 else:
                     # We have sub-code to evaluate
                     # Fill in any references to the results DB
-                    code = tuple(pickle.loads(comms.resultsDB.get(c.req_id)) if isinstance(c, _NonExistingResult) else c for c in code)
+                    code = tuple(pickle.loads(comms.resultsDB.get(c.req_id)) if isinstance(c, _PendingResultLong) else c for c in code)
                     code = tuple(process_nested(c) for c in code)
                     Language._to_be_revived_queue_add(comms, req_id, tuple(code))
                     if DEBUG:
                         comms.toBeLoggedQ.put('[{:s}] {:s} sending {:s} to toBeRevivedQ.'.format(_time_stamp_str(), str(worker_id), str(pickle.loads(req_id))))
-                                    
+
 
     @staticmethod
     def _revival_worker_method(worker_id, comms):
         '''Restart calculations which were on hold waiting for inputs'''
-        # Questionable method
-        tasks = []
+
+
+        WaitingRequest = namedtuple('WaitingRequest', ['deps', 'req_id', 'code'])
+        tasks = [] # will hols WaitingRequets
 
         comms.resultsPubSub.subscribe('calc-completed')
 
@@ -207,16 +222,16 @@ class Language():
             else:
                 # Fill in any results we can find in the db, including ones other than finished_req_id. Why wait if they are available?
                 code = tuple(pickle.loads(comms.resultsDB.get(c.req_id))
-                             if isinstance(c, _NonExistingResult) and comms.resultsDB.exists(c.req_id)
+                             if isinstance(c, _PendingResultLong) and comms.resultsDB.exists(c.req_id)
                              else c
                              for c in task.code)
-                deps = {c.req_id for c in code if isinstance(c, _NonExistingResult)}
+                deps = {c.req_id for c in code if isinstance(c, _PendingResultLong)}
                 if deps:
                     # There are still unmet deps
-                    return _WaitingRequest(deps, task.req_id, code)
+                    return WaitingRequest(deps, task.req_id, code)
                 else:
                     # This guy is ready
-                    Language._to_be_calculated_queue_add(comms, task.req_id, task.code)
+                    Language._to_be_calculated_queue_long_add(comms, task.req_id, task.code)
                     return None
 
         while True:
@@ -239,18 +254,18 @@ class Language():
                     # We got a new one
                     # Some results could have come in since this was added to the queue, so check now
                     code = tuple(pickle.loads(comms.resultsDB.get(c.req_id))
-                                 if isinstance(c, _NonExistingResult) and comms.resultsDB.exists(c.req_id)
+                                 if isinstance(c, _PendingResultLong) and comms.resultsDB.exists(c.req_id)
                                  else c
                                  for c in code)
-                    deps = {c.req_id for c in code if isinstance(c, _NonExistingResult)}
+                    deps = {c.req_id for c in code if isinstance(c, _PendingResultLong)}
                     if deps:
-                        tasks.append(_WaitingRequest(deps, req_id, code))
+                        tasks.append(WaitingRequest(deps, req_id, code))
                         if DEBUG:
                             comms.toBeLoggedQ.put("[{:s}] {:s} Took on {:s} with deps {:s}".format(
                                 _time_stamp_str(), str(worker_id), str(pickle.loads(req_id)), str(deps)))
                     else:
                         # Everything is actually already ready
-                        Language._to_be_calculated_queue_add(comms, req_id, code)
+                        Language._to_be_calculated_queue_long_add(comms, req_id, code)
                         if DEBUG:
                             comms.toBeLoggedQ.put("[{:s}] {:s} {:s} is ready already".format(
                                 _time_stamp_str(), str(worker_id), str(pickle.loads(req_id))))
@@ -277,7 +292,7 @@ class Language():
 
     #----------------------------------------------------------------------------
     # Mini-language definition
-    
+
     class SpecialForms():
         '''Don't evaluate arguments first'''
 
@@ -329,21 +344,10 @@ class Language():
             return getattr(Language.Functions, code[0])(*code[1:])
 
 
-
-
 # NOTE: pickle wasn't happy with these being indside the class
-_NonExistingResult = namedtuple('_NonExistingResult', ['req_id'])
+_PendingResultLong = namedtuple('_PendingResultLong', ['req_id'])
+_PendingResultMedium = namedtuple('_PendingResultMedium', ['req_id'])
 
-_WaitingRequest = namedtuple('_WaitingRequest', ['deps', 'req_id', 'code'])
-
-# The package of connections and such passed to each worker.
-_Comms = namedtuple('_Comms', ['resultsDB',        # Db where results are stored
-                               'resultsPubSub',    # Publishing and subscribing to messages about calculation completion
-                               'toBeCalculatedQ',  # Queue for calculations ready to run
-                               'toBeReportedQ',    # Queue for calculations finished which need to be reported to user
-                               'toBeRevivedQ',     # Queue for calculations waiting for inputs to be ready
-                               'toBeLoggedQ',      # Queue for messages to be logged                                    
-                            ])
 def _time_stamp_str():
     '''Standardizes time stamp format'''
     return '{:.10f} {:s}'.format(time.monotonic(), time.strftime("%Y%m%d%H%S", time.gmtime()))
@@ -361,19 +365,19 @@ def _req_id_from_code(code):
 def main():
     '''Main as a real function'''
 
-    L = Language( num_calc_workers = 4,
-                  num_report_workers = 2,
-                  num_revival_workers = 2,
-                  num_log_workers = 1 )
-    
+    l = Language(num_calc_workers=4,
+                 num_report_workers=2,
+                 num_revival_workers=2,
+                 num_log_workers=1)
+
 
     for code in [('sum', 1, ('prod', 2, 3)),
                  ('frac', 1, 2, 3, 4),
                  ('frac', ('sum', 1., 2.), ('prod', 3., 4.)),
                  ('frac', (('evals_to_sum',), 1., 2.), ('prod', 3., 4.)),
                 ]:
-        req_id = L.request_calc(code)
-    L.join()
+        _ = l.request_calc(code)
+    l.join()
 
 if __name__ == '__main__':
     main()
