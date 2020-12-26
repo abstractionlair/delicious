@@ -133,16 +133,12 @@ def nintegrate(f, args, xmin, xmax):
     #     [ xmin + i * (xmax - xmin) / N for i in range(N+1)] -> [0, 1/3, 2/3, 1]
     # Then do trapezoid rule.
     
-    pn = 1
-    pxs = [xmin + i * (xmax - xmin) / pn for i in range(pn + 1)]
-    pfs = [f(x, *args) for x in pxs]
-    pr = (pfs[0] / 2. + sum(pfs[1:-1]) + pfs[-1] / 2.) * (xmin + xmax) / pn
-    pe = inf
-
-    n = 2
-    xs = [ xmin + i * (xmax - xmin) / n if i % 2 else pxs[i // 2] for i    in range(n+1) ]
-    fs = [ f(x, *args)                  if i % 2 else pfs[i // 2] for i, x in enumerate(xs) ]
-    r = (fs[0] / 2. + sum(fs[1:-1]) + fs[-1] / 2.) * (xmax - xmin) / n
+    pr = 0.
+    pe = inf    
+    n = 1
+    xs = [xmin + i * (xmax - xmin) / n for i in range(n + 1)]
+    fs = [f(x, *args) for x in xs]
+    r = (fs[0] / 2. + sum(fs[1:-1]) + fs[-1] / 2.) * (xmin + xmax) / n
     e = r - pr
         
     n = n * 2
